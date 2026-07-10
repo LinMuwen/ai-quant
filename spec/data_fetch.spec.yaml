@@ -1,0 +1,534 @@
+# =============================================================================
+# 量化交易 - 规范化数据获取规范 (Data Fetch Specification)
+# 版本: 1.0.0
+# 更新: 2026-07-04
+# =============================================================================
+# 本规范定义了本项目所有金融数据获取的标准化工作流。
+# 所有新增取数任务必须遵循此规范，确保：
+#   1. 配置与代码分离 (config-driven)
+#   2. 字段命名统一 (single source of truth)
+#   3. Pipeline 可追溯、可复现
+#   4. 错误处理分层、可降级
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# SECTION 1: 全局配置 (Global Configuration)
+# ---------------------------------------------------------------------------
+global:
+  project: "ai-quant"
+  timezone: "Asia/Shanghai"
+  currency:
+    default: "CNY"
+    exchange_rates:               # 汇率基准 (每月月初更新)
+      HKD_CNY: 0.92
+      USD_CNY: 7.25
+  date_format:
+    storage: "YYYYMMDD"           # 数据存储用 (如 20250703)
+    display: "YYYY-MM-DD"         # 展示用 (如 2025-07-03)
+
+  # ---------- 凭证管理 (CRITICAL: 不硬编码, 从环境变量读取) ----------
+  credentials:
+    tushare_token: "${TUSHARE_TOKEN}"   # 从系统环境变量注入
+    # 新增数据源在此注册
+
+  # ---------- 目录规范 ----------
+  paths:
+    raw_data:    "./data/raw/"          # 原始数据 (CSV, JSON)
+    processed:   "./data/processed/"    # 处理后数据
+    logs:        "./logs/"              # 运行日志
+    spec:        "./spec/"              # 本规范文件所在目录
+    outputs:     "./"                   # 面向用户的输出 (面板HTML等)
+
+  # ---------- 日志规范 ----------
+  logging:
+    level: "INFO"                       # DEBUG | INFO | WARNING | ERROR
+    format: "[{timestamp}] [{level}] [{stage}] {message}"
+
+# ---------------------------------------------------------------------------
+# SECTION 2: 数据源注册表 (Data Source Registry)
+# ---------------------------------------------------------------------------
+# 每个数据源必须在此注册，定义其接入方式、认证、频率限制、回退策略
+#
+data_sources:
+
+  # --- Tushare Pro (A股主数据源) ---
+  tushare_pro:
+    provider: "Tushare"
+    description: "A股日线/财务/指数数据"
+    type: "REST API"
+    endpoint: "https://api.tushare.pro"
+    auth:
+      method: "token"
+      token_ref: "${TUSHARE_TOKEN}"
+    rate_limit:
+      max_calls_per_minute: 200         # Tushare 基础权限: 200次/分钟
+      max_points_per_call: 5000
+      retry_delay_seconds: 60
+    available_interfaces:
+      - name: "daily"
+        description: "A股日线行情"
+        path: "/"
+        params_template:
+          api_name: "daily"
+      - name: "hk_daily"
+        description: "港股日线行情 (注意: 频率限制 1次/小时)"
+        path: "/"
+        params_template:
+          api_name: "hk_daily"
+        rate_override:
+          max_calls_per_hour: 1          # 港股接口特殊限制
+      - name: "income"
+        description: "利润表"
+        path: "/"
+        params_template:
+          api_name: "income"
+      - name: "balancesheet"
+        description: "资产负债表"
+        path: "/"
+        params_template:
+          api_name: "balancesheet"
+      # 更多接口按需追加...
+
+  # --- 腾讯行情 API (港股备用数据源) ---
+  tencent_quote:
+    provider: "Tencent"
+    description: "港股/美股行情数据 (Web接口, 需严格UA检查)"
+    type: "HTTP JSON"
+    endpoint: "https://web.ifzq.gtimg.cn/appstock/app"
+    auth:
+      method: "none"                     # 公开接口, 无需认证
+    headers_required:
+      User-Agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+      Referer: "https://web.ifzq.gtimg.cn/"
+    proxy_policy: "disabled"             # 必须禁用代理
+    rate_limit:
+      max_calls_per_minute: 30           # 保守估计
+      retry_delay_seconds: 5
+    available_interfaces:
+      - name: "hk_kline"
+        description: "港股日线K线 (前复权)"
+        path: "/hkfqkline/get"
+        params_template:
+          param: "hk{code},day,{start_date},{end_date},640,qfq"
+      - name: "us_kline"
+        description: "美股日线K线 (前复权)"
+        path: "/usfqkline/get"
+        params_template:
+          param: "us{code},day,{start_date},{end_date},640,qfq"
+
+# ---------------------------------------------------------------------------
+# SECTION 3: 标准化字段定义 (Standard Field Schema)
+# ---------------------------------------------------------------------------
+# 所有数据输出统一使用以下字段名和数据类型。
+# 各数据源的原始字段通过 SECTION 4 的 mapping 映射到此标准。
+#
+standard_fields:
+
+  # --- 标识字段 ---
+  identity:
+    - name: "asset_code"
+      type: "string"
+      description: "资产代码 (如 688981.SH)"
+      example: "688981.SH"
+      required: true
+    - name: "market"
+      type: "string"
+      description: "市场标识 (SH=上海, SZ=深圳, HK=中国香港, US=美股)"
+      enum: ["SH", "SZ", "HK", "US"]
+      required: true
+    - name: "trade_date"
+      type: "string"
+      format: "YYYYMMDD"
+      description: "交易日"
+      required: true
+
+  # --- OHLCV 行情字段 ---
+  ohlcv:
+    - name: "open"
+      type: "float"
+      unit: "price"
+      description: "开盘价"
+      validation: { min: 0 }
+    - name: "high"
+      type: "float"
+      unit: "price"
+      description: "最高价"
+      validation: { min: 0 }
+    - name: "low"
+      type: "float"
+      unit: "price"
+      description: "最低价"
+      validation: { min: 0 }
+    - name: "close"
+      type: "float"
+      unit: "price"
+      description: "收盘价"
+      validation: { min: 0 }
+    - name: "pre_close"
+      type: "float"
+      unit: "price"
+      description: "前收盘价"
+      validation: { min: 0 }
+    - name: "change"
+      type: "float"
+      unit: "price"
+      description: "涨跌额 (close - pre_close)"
+    - name: "pct_chg"
+      type: "float"
+      unit: "percent"
+      description: "涨跌幅 (%)"
+    - name: "volume"
+      type: "float"
+      unit: "lots"                        # 统一为"手"
+      description: "成交量 (手, 1手=100股)"
+      validation: { min: 0 }
+    - name: "amount"
+      type: "float"
+      unit: "currency"
+      description: "成交额 (以目标币种为单位)"
+      validation: { min: 0 }
+
+  # --- 衍生指标 (Pipeline 计算生成) ---
+  derived:
+    - name: "price_norm"
+      type: "float"
+      description: "归一化价格 (首日=100)"
+    - name: "ma_5"
+      type: "float"
+      description: "5日均线"
+    - name: "ma_20"
+      type: "float"
+      description: "20日均线"
+    - name: "ma_60"
+      type: "float"
+      description: "60日均线"
+    - name: "vol_ma_5"
+      type: "float"
+      description: "5日均量"
+    - name: "amplitude"
+      type: "float"
+      unit: "percent"
+      description: "振幅 (%) = (high-low)/pre_close * 100"
+
+# ---------------------------------------------------------------------------
+# SECTION 4: 资产定义模板 (Asset Definition)
+# ---------------------------------------------------------------------------
+# 每个待取数的资产按此模板定义。
+# 单一资产取数: 填写 single_assets
+# 跨市场对比 (如AH股): 填写 cross_market_pairs
+#
+assets:
+
+  # ========== 单一资产示例 ==========
+  single_assets:
+    # ----- 示例: 中芯国际 A股 -----
+    - id: "smic_a"
+      name: "中芯国际"
+      asset_code: "688981.SH"
+      market: "SH"
+      asset_type: "stock"
+      data_source: "tushare_pro"
+      source_interface: "daily"
+      fetch:
+        frequency: "daily"
+        lookback_days: 365               # 近一年
+        fields:                          # 请求字段列表
+          - "ts_code"
+          - "trade_date"
+          - "open"
+          - "high"
+          - "low"
+          - "close"
+          - "pre_close"
+          - "change"
+          - "pct_chg"
+          - "vol"
+          - "amount"
+      output:
+        format: "csv"
+        filename: "smic_a_share.csv"
+        path: "./data/raw/"
+
+  # ========== 跨市场对比 (如AH股) ==========
+  cross_market_pairs:
+    - pair_id: "smic_ah"
+      pair_name: "中芯国际 AH股对比"
+      description: "A股(688981.SH) vs 港股(00981.HK) 跨市场对比"
+      legs:
+        - leg: "A"
+          id: "smic_a"
+          asset_code: "688981.SH"
+          market: "SH"
+          currency: "CNY"
+          data_source: "tushare_pro"
+          source_interface: "daily"
+          fetch:
+            frequency: "daily"
+            lookback_days: 365
+        - leg: "H"
+          id: "smic_hk"
+          asset_code: "00981.HK"
+          market: "HK"
+          currency: "HKD"
+          data_source: "tencent_quote"    # 腾讯API (Tushare港股限频)
+          source_interface: "hk_kline"
+          fallback_source: "tushare_pro"  # 回退到Tushare hk_daily
+          fallback_interface: "hk_daily"
+          fetch:
+            frequency: "daily"
+            lookback_days: 365
+      # --- 对比指标 ---
+      comparison_metrics:
+        - name: "ah_premium"
+          formula: "(a_close - hk_close * HKD_CNY_RATE) / (hk_close * HKD_CNY_RATE) * 100"
+          unit: "percent"
+          description: "AH 溢价率"
+        - name: "price_correlation"
+          formula: "corr(a_pct_chg, hk_pct_chg)"
+          description: "日涨跌幅相关系数"
+      # --- 对比输出 ---
+      combined_output:
+        formats: ["json", "csv"]
+        json_filename: "{pair_id}_combined.json"
+        csv_filename:  "{pair_id}_combined.csv"
+        path: "./data/processed/"
+      dashboard:
+        template: "ah_comparison_dashboard.html"
+        output_filename: "{pair_id}_dashboard.html"
+
+# ---------------------------------------------------------------------------
+# SECTION 5: 字段映射表 (Field Mapping)
+# ---------------------------------------------------------------------------
+# 将各数据源的原始字段映射到 standard_fields
+#
+field_mappings:
+
+  # ---- Tushare daily → 标准字段 ----
+  tushare_pro_daily:
+    identity:
+      asset_code: "ts_code"
+      trade_date: "trade_date"
+      market:                    # 从 ts_code 解析 (688981.SH → SH)
+        parser: "regex"
+        pattern: "\\.(?P<market>SH|SZ)$"
+    ohlcv:
+      open:       "open"
+      high:       "high"
+      low:        "low"
+      close:      "close"
+      pre_close:  "pre_close"
+      change:     "change"
+      pct_chg:    "pct_chg"
+      volume:     "vol"          # Tushare 已为"手"
+      amount:     "amount"       # Tushare 为"千元" → 需 Transform 中 ×1000
+
+  # ---- 腾讯港股K线 → 标准字段 ----
+  tencent_hk_kline:
+    description: |
+      腾讯港股K线原始格式:
+        [date, open, close, high, low, volume, _, pct_chg, amount]
+        date: "YYYY-MM-DD"
+        volume: 股 (需 /100 转为手)
+        amount: 万 (需 *10000 转为元)
+    identity:
+      asset_code: "ts_code"     # 写入时构造: "{code}.HK"
+      trade_date:
+        parser: "replace"
+        pattern: "-"
+        replacement: ""         # "YYYY-MM-DD" → "YYYYMMDD"
+      market:
+        value: "HK"             # 固定值
+    ohlcv:
+      open:       "[1]"
+      close:      "[2]"
+      high:       "[3]"
+      low:        "[4]"
+      volume:     "[5] / 100"   # 股 → 手
+      pct_chg:    "[7]"
+      amount:     "[8] * 10000" # 万 → 元
+    computed:
+      change:     "close - open"
+      pre_close:  "close.shift(1)"
+    missing_fields:
+      - "pre_close"             # 原始数据无前收价, 需计算
+
+# ---------------------------------------------------------------------------
+# SECTION 6: 数据转换 Pipeline (Transform Pipeline)
+# ---------------------------------------------------------------------------
+# 按顺序执行的处理阶段。每个阶段可选，输出为下一阶段的输入。
+#
+pipeline:
+  stages:
+
+    # Stage 0: 凭证验证
+    - name: "validate_credentials"
+      description: "验证所有API凭证可用"
+      mandatory: true
+      on_failure: "abort"               # abort | warn | skip
+
+    # Stage 1: 数据获取
+    - name: "fetch"
+      description: "从数据源获取原始数据"
+      mandatory: true
+      on_failure: "retry_then_fallback"
+      retry:
+        max_attempts: 3
+        backoff: "exponential"          # 1s → 2s → 4s
+      fallback:
+        strategy: "alternate_source"    # 回退到备用数据源
+
+    # Stage 2: 字段映射
+    - name: "map_fields"
+      description: "原始字段 → 标准字段映射 + 单位统一"
+      mandatory: true
+      output_schema: "standard_fields"
+      # 单位转换规则:
+      unit_conversions:
+        tushare_pro_daily:
+          amount: { from: "千元", to: "元", factor: 1000 }
+        tencent_hk_kline:
+          volume: { from: "股", to: "手", factor: 0.01 }
+          amount: { from: "万元", to: "元", factor: 10000 }
+
+    # Stage 3: 数据验证
+    - name: "validate"
+      description: "数据质量检查"
+      mandatory: true
+      checks:
+        - type: "completeness"
+          description: "必填字段非空率 > 99%"
+          threshold: 0.99
+        - type: "range"
+          description: "价格 > 0"
+          field: "close"
+          rule: ">= 0"
+        - type: "range"
+          description: "成交量 >= 0"
+          field: "volume"
+          rule: ">= 0"
+        - type: "trading_days"
+          description: "交易日数量 ≥ 预期营业日 × 90%"
+          min_ratio: 0.90
+        - type: "ohlc_consistency"
+          description: "low <= open,close,high 且 high >= open,close,low"
+        - type: "date_monotonic"
+          description: "日期严格递增、无重复"
+      on_validation_failure:
+        action: "warn_and_continue"     # abort | warn_and_continue | skip_row
+        log_bad_rows: true
+
+    # Stage 4: 衍生指标计算
+    - name: "derive"
+      description: "计算衍生指标 (均线、归一化等)"
+      mandatory: false
+      operations:
+        - name: "price_norm"
+          formula: "close / close[0] * 100"
+        - name: "ma_5"
+          formula: "close.rolling(5).mean()"
+        - name: "ma_20"
+          formula: "close.rolling(20).mean()"
+        - name: "ma_60"
+          formula: "close.rolling(60).mean()"
+        - name: "amplitude"
+          formula: "(high - low) / pre_close * 100"
+
+    # Stage 5: 跨资产关联 (仅 cross_market_pairs)
+    - name: "cross_asset_align"
+      description: "取共同交易日、计算对比指标"
+      mandatory: false
+      trigger: "cross_market_pairs only"
+      operations:
+        - name: "align_dates"
+          method: "intersection"         # intersection | union | left_join
+        - name: "compute_comparison_metrics"
+          description: "按 cross_market_pairs[].comparison_metrics 执行"
+
+    # Stage 6: 存储输出
+    - name: "persist"
+      description: "按 output 配置写入文件"
+      mandatory: true
+      output_formats:
+        - format: "csv"
+          encoding: "utf-8-sig"
+          index: false
+        - format: "json"
+          encoding: "utf-8"
+          orient: "records"
+
+    # Stage 7: 摘要报告
+    - name: "summary"
+      description: "生成运行摘要 (行数、区间、涨幅、数据质量)"
+      mandatory: false
+
+# ---------------------------------------------------------------------------
+# SECTION 7: 错误处理策略 (Error Handling)
+# ---------------------------------------------------------------------------
+error_handling:
+  categories:
+    network:
+      timeout_seconds: 15
+      max_retries: 3
+      backoff: "exponential"
+    rate_limit:
+      action: "wait_and_retry"
+      max_wait_seconds: 300
+    auth_failure:
+      action: "abort"
+      message: "凭证验证失败，请检查环境变量"
+    data_empty:
+      action: "warn_and_fallback"
+      message: "数据返回为空，尝试备用数据源"
+    data_partial:
+      action: "warn_and_continue"
+      message: "部分数据缺失，继续处理"
+    schema_mismatch:
+      action: "abort"
+      message: "数据格式与预期不符，需人工介入"
+
+# ---------------------------------------------------------------------------
+# SECTION 8: 版本与变更记录 (Changelog)
+# ---------------------------------------------------------------------------
+changelog:
+  - version: "1.0.0"
+    date: "2026-07-04"
+    changes:
+      - "初始版本: 基于中芯国际AH股取数经验总结"
+      - "定义数据源注册 (Tushare Pro + 腾讯行情)"
+      - "标准化字段体系 (identity + ohlcv + derived)"
+      - "资产定义模板 (single + cross_market)"
+      - "字段映射表 (已知数据源)"
+      - "Pipeline 六阶段规范"
+      - "错误处理分层策略"
+
+# ---------------------------------------------------------------------------
+# SECTION 9: 快速使用指南 (Quick Start)
+# ---------------------------------------------------------------------------
+#
+# 新增一只 A 股取数:
+#   1. 在 assets.single_assets 添加新条目
+#   2. 填写 asset_code, market, data_source, fetch.lookback_days
+#   3. 执行: python fetch_by_spec.py --asset <asset_id>
+#
+# 新增一个 AH 对比:
+#   1. 在 assets.cross_market_pairs 添加新 pair
+#   2. 填写两腿的 leg 信息
+#   3. 定义 comparison_metrics
+#   4. 执行: python fetch_by_spec.py --pair <pair_id>
+#
+# 新增数据源:
+#   1. 在 data_sources 注册新数据源
+#   2. 在 field_mappings 添加字段映射
+#   3. 在 pipeline.unit_conversions 添加单位转换规则
+#
+# 取数频率建议:
+#   - 每日行情: 每天 18:00 (收盘后) 运行
+#   - 财务数据: 每季度末后 45 天运行
+#   - 指数成分: 每半年运行
+#
+# TODO (未来扩展):
+#   - [ ] 增量更新 (只拉取新增天数, 不重复拉取)
+#   - [ ] 联邦学习式数据合并 (多数据源交叉验证)
+#   - [ ] 实时行情 WebSocket 支持
+#   - [ ] 数据血缘追踪 (record lineage: source → transform → output)
+#   - [ ] CI/CD 集成 (GitHub Actions 定时取数 → 自动部署面板)
